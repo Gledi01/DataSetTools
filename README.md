@@ -47,16 +47,24 @@
 
 ---
 
+## Cara menambahkan dataset
+
+```bash
+nano <nama dataset yang kamu inginkan>.dts
+```
+setelah itu save dan buka tools nya
+---
+
 ## Instalasi
 
 ### Persiapan (Termux/Linux)
 
 ```bash
 # Clone repository
-git clone https://github.com/Gledi01/dataset-tools.git
-cd dataset-tools
+git clone https://github.com/Gledi01/DataSetTools
+cd DataSetTools
 
-# Install dependencies
+# jalankan Setup.sh
 bash setup.sh
 
 # Jalankan aplikasi

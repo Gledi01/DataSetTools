@@ -68,4 +68,4 @@ cd DataSetTools
 bash setup.sh
 
 # Jalankan aplikasi
-python3 main.py
+python Dataset.py

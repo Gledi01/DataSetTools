@@ -1,3 +1,4 @@
+cd ../
 cp -r DataSetTools ~/
 cd DataSetTools 
 mkdir main

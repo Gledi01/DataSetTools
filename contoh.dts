@@ -1,0 +1,4 @@
+Ini adalah contoh dataset, 
+format file <nama_file>.dts
+Kamu bisa membuat dts baru menggunakan nano <nama_file_baru>.dts
+dan tulis dataset kamu lalu simpan, dan akan tampil di tools 

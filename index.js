@@ -4,8 +4,10 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  makeInMemoryStore,
   isJidBroadcast,
   isJidStatusBroadcast,
+  jidNormalizedUser,
 } = require('@whiskeysockets/baileys');
 
 const pino = require('pino');
@@ -14,48 +16,58 @@ const fs = require('fs');
 
 const { initDatabase } = require('../database/db');
 const { handleCommand } = require('./handlers/commandHandler');
-const { normalizeJid, getChatId } = require('./utils/helpers');
 
-// Auth state folder
 const AUTH_FOLDER = path.join(__dirname, '../auth');
 if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
 
-// Logger (suppress verbose Baileys logs)
 const logger = pino({ level: 'silent' });
 
+// InMemoryStore — handle message store + LID mapping otomatis
+const store = makeInMemoryStore({ logger });
+store.readFromFile('./baileys_store.json');
+setInterval(() => store.writeToFile('./baileys_store.json'), 10_000);
+
 /**
- * Custom in-memory signal key store (pengganti makeCacheableSignalKeyStore yang deprecated).
+ * Resolve JID: gunakan remoteJidAlt jika participant adalah @lid
+ * Sesuai dokumentasi Baileys terbaru — jangan konvert, pakai Alt field
  */
-function makeCustomKeyStore(keys) {
-  const cache = {};
-  return {
-    get: async (type, ids) => {
-      const data = {};
-      for (const id of ids) {
-        const cacheKey = `${type}:${id}`;
-        if (cache[cacheKey] !== undefined) {
-          data[id] = cache[cacheKey];
-        } else {
-          const val = await keys.get(type, [id]);
-          const item = val?.[id];
-          cache[cacheKey] = item ?? null;
-          if (item !== undefined && item !== null) data[id] = item;
-        }
-      }
-      return data;
-    },
-    set: async (data) => {
-      for (const [type, ids] of Object.entries(data)) {
-        for (const [id, value] of Object.entries(ids)) {
-          cache[`${type}:${id}`] = value;
-        }
-      }
-      await keys.set(data);
-    },
-    clear: () => {
-      for (const key of Object.keys(cache)) delete cache[key];
-    },
-  };
+function resolveJid(msg) {
+  const key = msg.key;
+  // Di grup: participant bisa @lid, Alt-nya adalah PN
+  const raw = key.participant || key.remoteJid;
+  // remoteJidAlt tersedia di Baileys terbaru sebagai PN fallback
+  const alt = key.participantAlt || key.remoteJidAlt;
+
+  if (raw && raw.endsWith('@lid') && alt) {
+    return jidNormalizedUser(alt);
+  }
+  if (raw) {
+    return jidNormalizedUser(raw);
+  }
+  return null;
+}
+
+function resolveChatId(msg) {
+  const jid = msg.key.remoteJid;
+  // Kalau remoteJid adalah @lid, pakai Alt
+  if (jid && jid.endsWith('@lid') && msg.key.remoteJidAlt) {
+    return msg.key.remoteJidAlt;
+  }
+  return jid;
+}
+
+function extractText(msg) {
+  const m = msg.message;
+  if (!m) return null;
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.buttonsResponseMessage?.selectedButtonId ||
+    m.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    null
+  );
 }
 
 async function connectToWhatsApp() {
@@ -67,14 +79,17 @@ async function connectToWhatsApp() {
   const sock = makeWASocket({
     version,
     logger,
-    auth: {
-      creds: state.creds,
-      keys: makeCustomKeyStore(state.keys),
-    },
+    auth: state,
     generateHighQualityLinkPreview: false,
     browser: ['WA RPG Bot', 'Chrome', '1.0.0'],
-    getMessage: async () => undefined,
+    getMessage: async (key) => {
+      const msg = await store.loadMessage(key.remoteJid, key.id);
+      return msg?.message || undefined;
+    },
   });
+
+  // Bind store ke socket — ini yang handle LID mapping otomatis
+  store.bind(sock.ev);
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -89,12 +104,13 @@ async function connectToWhatsApp() {
     }
 
     if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('❌ Koneksi terputus. Reconnect:', shouldReconnect);
+      const code = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = code !== DisconnectReason.loggedOut;
+      console.log('❌ Koneksi terputus, kode:', code, '| Reconnect:', shouldReconnect);
       if (shouldReconnect) {
         setTimeout(() => connectToWhatsApp(), 5000);
       } else {
-        console.log('🚫 Logged out. Hapus folder auth/ dan restart bot.');
+        console.log('🚫 Logged out. Hapus folder auth/ dan restart.');
       }
     } else if (connection === 'open') {
       console.log('✅ Bot WhatsApp RPG berhasil terhubung!');
@@ -108,63 +124,36 @@ async function connectToWhatsApp() {
     for (const msg of messages) {
       try {
         if (!msg.message) continue;
+        if (msg.key.fromMe) continue;
+        if (!msg.key.remoteJid) continue;
         if (isJidBroadcast(msg.key.remoteJid)) continue;
         if (isJidStatusBroadcast(msg.key.remoteJid)) continue;
-        if (msg.key.fromMe) continue;
 
-        // Resolve @lid ke @s.whatsapp.net
-        const senderRaw = msg.key.participant || msg.key.remoteJid;
-        if (!senderRaw) continue;
+        const senderJid = resolveJid(msg);
+        const chatId = resolveChatId(msg);
 
-        let resolvedJid = senderRaw;
-        if (senderRaw.endsWith('@lid')) {
-          const contact = sock.contacts?.[senderRaw];
-          if (contact?.id) {
-            resolvedJid = contact.id;
-          } else {
-            resolvedJid = senderRaw.replace('@lid', '@s.whatsapp.net');
-          }
-        }
+        if (!senderJid || !chatId) continue;
 
-        // Override JID di msg agar semua handler baca yang sudah resolved
-        if (msg.key.participant) msg.key.participant = resolvedJid;
-        else msg.key.remoteJid = resolvedJid;
+        const text = extractText(msg);
+        if (!text) continue;
 
-        // Extract message text
-        const msgText = extractMessageText(msg);
-        if (!msgText) continue;
+        console.log(`📩 [${new Date().toLocaleTimeString()}] ${senderJid.split('@')[0]} → ${chatId.split('@')[0]}: ${text.slice(0, 60)}`);
 
-        // Log incoming
-        const sender = normalizeJid(resolvedJid);
-        const chatId = getChatId(msg);
-        console.log(`📩 [${new Date().toLocaleTimeString()}] ${sender?.split('@')[0]}: ${msgText.slice(0, 60)}`);
+        if (!text.startsWith('.')) continue;
 
-        // Handle commands (starts with .)
-        if (msgText.startsWith('.')) {
-          await handleCommand(sock, msg, msgText);
-        }
+        // Override key biar handleCommand baca JID yang sudah resolved
+        if (msg.key.participant) msg.key.participant = senderJid;
+        msg.key.remoteJid = chatId;
+
+        await handleCommand(sock, msg, text);
 
       } catch (err) {
-        console.error('❌ Error handling message:', err.message);
+        console.error('❌ Error handle message:', err.message, err.stack);
       }
     }
   });
 
   return sock;
-}
-
-function extractMessageText(msg) {
-  const m = msg.message;
-  if (!m) return null;
-  return (
-    m.conversation ||
-    m.extendedTextMessage?.text ||
-    m.imageMessage?.caption ||
-    m.videoMessage?.caption ||
-    m.buttonsResponseMessage?.selectedButtonId ||
-    m.listResponseMessage?.singleSelectReply?.selectedRowId ||
-    null
-  );
 }
 
 connectToWhatsApp().catch(err => {
@@ -173,9 +162,9 @@ connectToWhatsApp().catch(err => {
 });
 
 process.on('uncaughtException', (err) => {
-  console.error('❌ Uncaught Exception:', err.message);
+  console.error('❌ Uncaught:', err.message);
 });
 
 process.on('unhandledRejection', (reason) => {
-  console.error('❌ Unhandled Rejection:', reason?.message || reason);
+  console.error('❌ Rejection:', reason?.message || reason);
 });

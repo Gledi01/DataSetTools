@@ -3,7 +3,7 @@ const { db } = require('../../database/db');
 const { getActivePokemon, updatePokemonHp, addPokemonExp } = require('./pokemonSystem');
 const { getActiveDigimon, updateDigimonHp, addDigimonExp, increaseBond } = require('./digimonSystem');
 const { addCoins, addExp, getUser, removeCoins } = require('./userSystem');
-const { calcDamage, getTypeMultiplier, effectivenessText, hpBar, randInt } = require('../utils/helpers');
+const { calcDamageGen3, calcStat, calcHP, getTypeMultiplier, effectivenessText, hpBar, randInt, checkSTAB, isCriticalHit } = require('../utils/helpers');
 const { fetchMove } = require('../utils/pokeapi');
 const { v4: uuid } = require('crypto');
 
@@ -199,14 +199,21 @@ async function processPokemonTurn(jid, action, param) {
     const defTypes = parseTypes(defender.types);
 
     const typeMult = getTypeMultiplier(moveData.type, defTypes);
-    const dmg = calcDamage(attacker.attack, defender.defense || defender.stats?.defense || 40, moveData.power || 40, typeMult);
+    const attackerTypes = attacker.types || [];
+    const stab = checkSTAB(moveData.type, attackerTypes);
+    const crit = isCriticalHit();
+    const attackerLevel = attacker.level || 5;
+    const atkStat = attacker.attack || 10;
+    const defStat = defender.defense || defender.stats?.defense || 10;
+    const dmg = calcDamageGen3(attackerLevel, atkStat, defStat, moveData.power || 40, typeMult, stab, crit);
+    const critText = crit ? '\n💥 *Critical Hit!*' : '';
 
     // Apply damage
     if (battle.type === 'wild') {
       battle.wildPokemon.currentHp = Math.max(0, battle.wildPokemon.currentHp - dmg);
       result.messages.push(
         `⚔️ *${attacker.name.toUpperCase()}* menggunakan *${moveName.toUpperCase()}*!`,
-        `💥 Damage: ${dmg} ${effectivenessText(typeMult)}`,
+        `💥 Damage: ${dmg}${critText} ${effectivenessText(typeMult)}`,
         `❤️ ${battle.wildPokemon.name.toUpperCase()}: ${hpBar(battle.wildPokemon.currentHp, battle.wildPokemon.max_hp)}`
       );
 
@@ -231,12 +238,17 @@ async function processPokemonTurn(jid, action, param) {
       const wildMoves = battle.wildPokemon.moves?.slice(0, 4) || ['tackle'];
       const wildMove = wildMoves[Math.floor(Math.random() * wildMoves.length)];
       const wildMoveData = await fetchMove(wildMove);
+      const wildTypes = battle.wildPokemon.types || [];
       const wildTypeMult = getTypeMultiplier(wildMoveData.type, attacker.types || []);
-      const wildDmg = calcDamage(
-        battle.wildPokemon.stats?.attack || battle.wildPokemon.attack || 40,
-        attacker.defense,
-        wildMoveData.power || 35,
-        wildTypeMult
+      const wildStab = checkSTAB(wildMoveData.type, wildTypes);
+      const wildCrit = isCriticalHit();
+      const wildLevel = battle.wildPokemon.level || 5;
+      // Hitung atk wild dari base stat + level (Gen III formula)
+      const wildBaseAtk = battle.wildPokemon.stats?.attack || battle.wildPokemon.attack || 45;
+      const wildAtkStat = calcStat(wildBaseAtk, wildLevel);
+      const wildDmg = calcDamageGen3(
+        wildLevel, wildAtkStat, attacker.defense,
+        wildMoveData.power || 35, wildTypeMult, wildStab, wildCrit
       );
 
       const newUserHp = Math.max(0, attacker.hp - wildDmg);

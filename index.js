@@ -4,7 +4,6 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  makeInMemoryStore,
   isJidBroadcast,
   isJidStatusBroadcast,
   jidNormalizedUser,
@@ -22,38 +21,60 @@ if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
 
 const logger = pino({ level: 'silent' });
 
-// InMemoryStore — handle message store + LID mapping otomatis
-const store = makeInMemoryStore({ logger });
-store.readFromFile('./baileys_store.json');
-setInterval(() => store.writeToFile('./baileys_store.json'), 10_000);
+// ─── Simple message store (pengganti makeInMemoryStore yang dihapus) ───
+const msgStore = {};
+function storeMessage(jid, msg) {
+  if (!msgStore[jid]) msgStore[jid] = {};
+  msgStore[jid][msg.key.id] = msg;
+}
+function getStoredMessage(jid, id) {
+  return msgStore[jid]?.[id]?.message || undefined;
+}
 
-/**
- * Resolve JID: gunakan remoteJidAlt jika participant adalah @lid
- * Sesuai dokumentasi Baileys terbaru — jangan konvert, pakai Alt field
- */
-function resolveJid(msg) {
-  const key = msg.key;
-  // Di grup: participant bisa @lid, Alt-nya adalah PN
+// ─── Custom key store (pengganti makeCacheableSignalKeyStore yang deprecated) ───
+function makeCustomKeyStore(keys) {
+  const cache = {};
+  return {
+    get: async (type, ids) => {
+      const data = {};
+      for (const id of ids) {
+        const k = `${type}:${id}`;
+        if (cache[k] !== undefined) {
+          if (cache[k] !== null) data[id] = cache[k];
+        } else {
+          const val = await keys.get(type, [id]);
+          const item = val?.[id] ?? null;
+          cache[k] = item;
+          if (item !== null) data[id] = item;
+        }
+      }
+      return data;
+    },
+    set: async (data) => {
+      for (const [type, ids] of Object.entries(data)) {
+        for (const [id, val] of Object.entries(ids)) {
+          cache[`${type}:${id}`] = val;
+        }
+      }
+      await keys.set(data);
+    },
+    clear: () => { for (const k of Object.keys(cache)) delete cache[k]; },
+  };
+}
+
+// ─── Resolve JID: handle @lid dengan pakai Alt field ───
+function resolveJid(key) {
   const raw = key.participant || key.remoteJid;
-  // remoteJidAlt tersedia di Baileys terbaru sebagai PN fallback
+  // Baileys terbaru: jika @lid, Alt berisi PN asli
   const alt = key.participantAlt || key.remoteJidAlt;
-
-  if (raw && raw.endsWith('@lid') && alt) {
-    return jidNormalizedUser(alt);
-  }
-  if (raw) {
-    return jidNormalizedUser(raw);
-  }
+  if (raw?.endsWith('@lid') && alt) return jidNormalizedUser(alt);
+  if (raw) return jidNormalizedUser(raw);
   return null;
 }
 
-function resolveChatId(msg) {
-  const jid = msg.key.remoteJid;
-  // Kalau remoteJid adalah @lid, pakai Alt
-  if (jid && jid.endsWith('@lid') && msg.key.remoteJidAlt) {
-    return msg.key.remoteJidAlt;
-  }
-  return jid;
+function resolveChatId(key) {
+  if (key.remoteJid?.endsWith('@lid') && key.remoteJidAlt) return key.remoteJidAlt;
+  return key.remoteJid;
 }
 
 function extractText(msg) {
@@ -79,27 +100,35 @@ async function connectToWhatsApp() {
   const sock = makeWASocket({
     version,
     logger,
-    auth: state,
+    auth: {
+      creds: state.creds,
+      keys: makeCustomKeyStore(state.keys),
+    },
     generateHighQualityLinkPreview: false,
     browser: ['WA RPG Bot', 'Chrome', '1.0.0'],
-    getMessage: async (key) => {
-      const msg = await store.loadMessage(key.remoteJid, key.id);
-      return msg?.message || undefined;
-    },
+    getMessage: async (key) => getStoredMessage(key.remoteJid, key.id),
   });
 
-  // Bind store ke socket — ini yang handle LID mapping otomatis
-  store.bind(sock.ev);
-
   sock.ev.on('creds.update', saveCreds);
+
+  // Simpan pesan masuk ke store lokal
+  sock.ev.on('messages.upsert', ({ messages }) => {
+    for (const msg of messages) {
+      if (msg.key?.remoteJid) storeMessage(msg.key.remoteJid, msg);
+    }
+  });
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      const QRCode = require('qrcode');
-      const qrString = await QRCode.toString(qr, { type: 'terminal', small: true });
-      console.log(qrString);
+      try {
+        const QRCode = require('qrcode');
+        const str = await QRCode.toString(qr, { type: 'terminal', small: true });
+        console.log(str);
+      } catch {
+        console.log('QR:', qr);
+      }
       console.log('📱 Scan QR di atas!');
     }
 
@@ -107,11 +136,8 @@ async function connectToWhatsApp() {
       const code = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = code !== DisconnectReason.loggedOut;
       console.log('❌ Koneksi terputus, kode:', code, '| Reconnect:', shouldReconnect);
-      if (shouldReconnect) {
-        setTimeout(() => connectToWhatsApp(), 5000);
-      } else {
-        console.log('🚫 Logged out. Hapus folder auth/ dan restart.');
-      }
+      if (shouldReconnect) setTimeout(() => connectToWhatsApp(), 5000);
+      else console.log('🚫 Logged out. Hapus folder auth/ dan restart.');
     } else if (connection === 'open') {
       console.log('✅ Bot WhatsApp RPG berhasil terhubung!');
       console.log('🎮 Bot siap menerima perintah.\n');
@@ -129,26 +155,26 @@ async function connectToWhatsApp() {
         if (isJidBroadcast(msg.key.remoteJid)) continue;
         if (isJidStatusBroadcast(msg.key.remoteJid)) continue;
 
-        const senderJid = resolveJid(msg);
-        const chatId = resolveChatId(msg);
+        const senderJid = resolveJid(msg.key);
+        const chatId = resolveChatId(msg.key);
 
         if (!senderJid || !chatId) continue;
 
         const text = extractText(msg);
         if (!text) continue;
 
-        console.log(`📩 [${new Date().toLocaleTimeString()}] ${senderJid.split('@')[0]} → ${chatId.split('@')[0]}: ${text.slice(0, 60)}`);
+        console.log(`📩 [${new Date().toLocaleTimeString()}] ${senderJid.split('@')[0]}: ${text.slice(0, 60)}`);
 
         if (!text.startsWith('.')) continue;
 
-        // Override key biar handleCommand baca JID yang sudah resolved
+        // Override key agar handler baca JID resolved
         if (msg.key.participant) msg.key.participant = senderJid;
         msg.key.remoteJid = chatId;
 
         await handleCommand(sock, msg, text);
 
       } catch (err) {
-        console.error('❌ Error handle message:', err.message, err.stack);
+        console.error('❌ Error:', err.message, '\n', err.stack);
       }
     }
   });
@@ -157,14 +183,9 @@ async function connectToWhatsApp() {
 }
 
 connectToWhatsApp().catch(err => {
-  console.error('❌ Fatal error:', err);
+  console.error('❌ Fatal:', err);
   process.exit(1);
 });
 
-process.on('uncaughtException', (err) => {
-  console.error('❌ Uncaught:', err.message);
-});
-
-process.on('unhandledRejection', (reason) => {
-  console.error('❌ Rejection:', reason?.message || reason);
-});
+process.on('uncaughtException', (err) => console.error('❌ Uncaught:', err.message));
+process.on('unhandledRejection', (r) => console.error('❌ Rejection:', r?.message || r));
